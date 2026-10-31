@@ -1,0 +1,234 @@
+description: >
+  Scans for leaked secrets with TruffleHog: the commits a branch adds, a
+  checkout's whole history, or the files under some paths. Writes JSON,
+  SARIF and JUnit reports that name where each secret is, its detector and
+  whether it was verified, but never hold any part of the secret itself.
+  Secrets at or above fail_on fail the step unless report_only is true. A
+  scan that can't complete, reports a scan error, or scanned nothing fails
+  either way. TruffleHog never checks a secret with the service it belongs
+  to unless verify is true. Run install first.
+parameters:
+  source:
+    type: enum
+    enum: [git, filesystem]
+    default: git
+    description: >
+      What to scan. "git" (default) scans commits of the git checkout the
+      working directory is in, as scope says, which is what catches a
+      secret that was committed and then deleted. "filesystem" scans the
+      files under paths as they are now, leaving out .git directories.
+  scope:
+    type: enum
+    enum: [changes, history, all]
+    default: changes
+    description: >
+      Which commits a git scan reads. "changes" (default): the commits HEAD
+      adds since it left base_ref, the pull request's base on GitHub Actions,
+      or the remote's default branch, so a secret already in history doesn't
+      fail every build after it. "history": every commit HEAD's history
+      holds. "all": every ref in the checkout, other branches and tags
+      included. A shallow checkout has only part of the history: check out
+      with all of it (actions/checkout: fetch-depth: 0).
+  base_ref:
+    type: string
+    default: ""
+    description: >
+      For scope changes: the branch, tag or commit whose code is already
+      scanned, such as origin/main. The scan covers the commits since HEAD
+      left it (their merge base). Empty: on GitHub Actions, the pull
+      request's base, the commit before a push, or the merge group's base;
+      otherwise origin/HEAD, origin/main or origin/master. On CircleCI, pass
+      the pipeline value pipeline.git.base_revision to scan what each push
+      to a branch adds, including the default branch. Environment variables
+      are expanded.
+  max_depth:
+    type: integer
+    default: 0
+    description: >
+      For source git: scan at most this many commits, newest first. 0
+      (default) has no limit.
+  paths:
+    type: string
+    default: ""
+    description: >
+      For source filesystem: the files and directories to scan, separated by
+      commas, spaces or newlines, relative to working_dir. Empty scans
+      working_dir. Environment variables are expanded.
+  verify:
+    type: boolean
+    default: false
+    description: >
+      Have TruffleHog check each secret it finds with the service it belongs
+      to, such as AWS or GitHub, to see whether it still works. That sends
+      every secret found out of this job to that service, which may log the
+      attempt, so it is off by default: every secret found is then
+      "unverified", or "unknown" when TruffleHog can't tell what it is.
+  fail_on:
+    type: enum
+    enum: [unverified, unknown, verified]
+    default: unverified
+    description: >
+      The least certain result that fails the step. "unverified" (default):
+      every secret found. "unknown": secrets verification confirmed or could
+      not decide about. "verified": only secrets verification confirmed
+      work, which needs verify: true.
+  include_paths:
+    type: string
+    default: ""
+    description: >
+      A file of regular expressions, one per line, that a file's path must
+      match to be scanned (TruffleHog's --include-paths). Environment
+      variables are expanded.
+  exclude_paths:
+    type: string
+    default: ""
+    description: >
+      A file of regular expressions, one per line, for paths not to scan,
+      such as test fixtures (TruffleHog's --exclude-paths). Environment
+      variables are expanded.
+  exclude_globs:
+    type: string
+    default: ""
+    description: >
+      For source git: comma-separated globs of paths git leaves out of the
+      diffs TruffleHog reads (--exclude-globs), which is faster than
+      exclude_paths for large directories. Environment variables are
+      expanded.
+  include_detectors:
+    type: string
+    default: ""
+    description: >
+      Detectors to run, such as github or aws, detector type numbers or
+      ranges of them, separated by commas or spaces. Empty runs all of them.
+      Environment variables are expanded.
+  exclude_detectors:
+    type: string
+    default: ""
+    description: >
+      Detectors not to run, in the same form as include_detectors.
+      Environment variables are expanded.
+  config:
+    type: string
+    default: ""
+    description: >
+      A TruffleHog configuration file with custom regular-expression
+      detectors. Their results are named CustomRegex. Environment variables
+      are expanded.
+  no_ignore_tag:
+    type: boolean
+    default: false
+    description: >
+      Report secrets that have a trufflehog:ignore comment after them on the
+      same line, which TruffleHog otherwise leaves out.
+  allow_empty:
+    type: boolean
+    default: false
+    description: >
+      For source filesystem: pass when there is nothing to read under paths
+      (every file excluded, empty or unreadable), which otherwise fails the
+      step, since nothing was checked.
+  extra_args:
+    type: string
+    default: ""
+    description: >
+      More TruffleHog options, split like shell words: its tuning options
+      only, such as --concurrency 4, --detector-timeout 30s,
+      --force-skip-binaries, --allow-verification-overlap or
+      --trust-local-git-config. Options that decide what is scanned or
+      reported are parameters, and are refused here. Environment variables
+      are expanded.
+  working_dir:
+    type: string
+    default: "."
+    description: >
+      The directory to run in: inside the git checkout to scan, or the
+      directory paths are relative to.
+  output_dir:
+    type: string
+    default: /tmp/trufflehog-reports
+    description: >
+      Absolute path of the directory for the reports: <report_name>.json
+      (every secret found, without the secret), <report_name>.sarif (those in
+      a file, for GitHub code scanning), junit/<report_name>.xml and the run
+      record. Not expanded, since the store steps read it as given.
+  report_name:
+    type: string
+    default: trufflehog
+    description: >
+      The name every report of this scan starts with, so several scans can
+      share output_dir.
+  junit:
+    type: boolean
+    default: true
+    description: >
+      Write junit/<report_name>.xml, with a failed test for each secret at or
+      above fail_on and a skipped one for each below, and store it as test
+      results.
+  run_record:
+    type: boolean
+    default: false
+    description: >
+      Write <report_name>.run-record.json: what was scanned, with which
+      TruffleHog and options, and what it found, as described by
+      schemas/run-record.v1.json.
+  report_only:
+    type: boolean
+    default: false
+    description: >
+      Pass even when secrets at or above fail_on were found, with a warning.
+      A scan that can't complete still fails.
+  store_artifacts:
+    type: boolean
+    default: true
+    description: >
+      Store output_dir as job artifacts, even when the scan fails. The
+      reports never hold a secret, but they name the files, commits and
+      authors where secrets were found.
+  no_output_timeout:
+    type: string
+    default: 10m
+    description: >
+      How long the scan may run without printing anything, such as 30m for a
+      long history.
+steps:
+  - run:
+      name: TruffleHog scan (<< parameters.source >>)
+      working_directory: << parameters.working_dir >>
+      no_output_timeout: << parameters.no_output_timeout >>
+      environment:
+        PARAM_ALLOW_EMPTY: << parameters.allow_empty >>
+        PARAM_BASE_REF: << parameters.base_ref >>
+        PARAM_CONFIG: << parameters.config >>
+        PARAM_EXCLUDE_DETECTORS: << parameters.exclude_detectors >>
+        PARAM_EXCLUDE_GLOBS: << parameters.exclude_globs >>
+        PARAM_EXCLUDE_PATHS: << parameters.exclude_paths >>
+        PARAM_EXTRA_ARGS: << parameters.extra_args >>
+        PARAM_FAIL_ON: << parameters.fail_on >>
+        PARAM_INCLUDE_DETECTORS: << parameters.include_detectors >>
+        PARAM_INCLUDE_PATHS: << parameters.include_paths >>
+        PARAM_JUNIT: << parameters.junit >>
+        PARAM_MAX_DEPTH: << parameters.max_depth >>
+        PARAM_NO_IGNORE_TAG: << parameters.no_ignore_tag >>
+        PARAM_OUTPUT_DIR: << parameters.output_dir >>
+        PARAM_PATHS: << parameters.paths >>
+        PARAM_REPORT_NAME: << parameters.report_name >>
+        PARAM_REPORT_ONLY: << parameters.report_only >>
+        PARAM_RUN_RECORD: << parameters.run_record >>
+        PARAM_SCOPE: << parameters.scope >>
+        PARAM_SOURCE: << parameters.source >>
+        PARAM_VERIFY: << parameters.verify >>
+        SCRIPT_TRUFFLEHOG_LIB: << include(scripts/lib/trufflehog.sh) >>
+      command: << include(scripts/scan.sh) >>
+  - when:
+      condition: << parameters.junit >>
+      steps:
+        - store_test_results:
+            path: << parameters.output_dir >>/junit/<< parameters.report_name >>.xml
+            when: always
+  - when:
+      condition: << parameters.store_artifacts >>
+      steps:
+        - store_artifacts:
+            path: << parameters.output_dir >>
+            destination: trufflehog-reports
+            when: always

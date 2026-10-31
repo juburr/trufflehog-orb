@@ -1,0 +1,27 @@
+description: >
+  Audit a repository's whole history, every branch and tag included, on a
+  schedule. A secret in history stays there until it is rotated and the
+  history rewritten, so the audit reports what it finds without failing,
+  with a run record of exactly what was scanned.
+
+usage:
+  version: 2.1
+  orbs:
+    trufflehog: juburr/trufflehog-orb@0.1.0
+  jobs:
+    audit:
+      docker:
+        - image: cimg/base:current
+      steps:
+        - checkout
+        - trufflehog/install
+        - trufflehog/scan:
+            scope: all
+            report_only: true
+            run_record: true
+            report_name: audit
+            no_output_timeout: 30m
+  workflows:
+    weekly-audit:
+      jobs:
+        - audit

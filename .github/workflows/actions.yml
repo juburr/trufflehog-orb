@@ -1,0 +1,212 @@
+# Tests the GitHub Actions in actions/ on GitHub's own runners, as
+# .circleci/test-deploy.yml tests the orb's commands on CircleCI. Each job
+# runs the actions from this checkout (uses: ./actions/...), so a pull
+# request tests its own changes.
+name: GitHub Actions
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  offline-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install jsonschema
+        run: python3 -m pip install --quiet --user jsonschema==4.26.0
+      - name: Run the offline tests
+        run: |
+          for test in tests/*_test.sh; do
+            echo "=== ${test}"
+            bash "${test}"
+          done
+
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./actions/install
+      - name: Verify the install is the binary the checksum table pins
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          version=$(grep -A3 '^  version:' src/commands/install.yml | sed -n 's/^    default: "\(.*\)"$/\1/p')
+          [[ "$(command -v trufflehog)" == "${HOME}/bin/trufflehog" ]]
+          trufflehog --no-update --version | grep -qx "trufflehog ${version}"
+          expected=$(grep -F "[\"${version}/${ARCH}\"]" src/scripts/install.sh | cut -d'"' -f4)
+          [[ "$(sha512sum ~/bin/trufflehog | cut -d' ' -f1)" == "${expected}" ]]
+      # A second install takes the verified release from the cache.
+      - uses: ./actions/install
+      - id: unlisted
+        uses: ./actions/install
+        continue-on-error: true
+        with:
+          version: 3.96.0
+          install_path: ~/unlisted
+      - name: Verify an unlisted version fails closed
+        env:
+          UNLISTED: ${{ steps.unlisted.outcome }}
+        run: |
+          [[ "${UNLISTED}" == "failure" ]]
+          [[ ! -e ~/unlisted/trufflehog ]]
+
+  install-from-cache:
+    needs: install
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Block the download hosts
+        run: |
+          echo "127.0.0.1 github.com objects.githubusercontent.com release-assets.githubusercontent.com" \
+            | sudo tee -a /etc/hosts
+          if curl -sSf --max-time 10 -o /dev/null https://github.com; then
+            echo "github.com is still reachable."
+            exit 1
+          fi
+      - uses: ./actions/install
+      - name: Verify the install
+        run: trufflehog --no-update --version
+
+  # install_hash.sh must print the table's entries for the default, after a
+  # real cosign verifies the release's signed checksums. TruffleHog's
+  # releases carry a detached signature and certificate, which cosign 2
+  # verifies against the transparency log.
+  install-hash:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: juburr/cosign-orb/actions/install@422b417ef8fdca894e242d49111f6711f08d0e74 # v1.1.0
+        with:
+          version: 2.6.5
+      - name: Generate the default version's entries and compare them with the table
+        run: |
+          version=$(grep -A3 '^  version:' src/commands/install.yml | sed -n 's/^    default: "\(.*\)"$/\1/p')
+          bash src/scripts/install_hash.sh -v "${version}" | tee "${RUNNER_TEMP}/entries"
+          [[ "$(wc -l < "${RUNNER_TEMP}/entries")" -eq 2 ]]
+          while IFS= read -r entry; do
+            grep -qxF -- "${entry}" src/scripts/install.sh
+          done < "${RUNNER_TEMP}/entries"
+
+  # test-deploy.yml's scan-test: every way to scan the fixture, on both
+  # architectures. The fixture has its own origin, so its scans name
+  # base_ref: on GitHub Actions the default base is this run's event, whose
+  # commits the fixture doesn't have.
+  scan:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: ./actions/install
+      - name: Make the fixture repository
+        run: bash tests/make_fixture_repo.sh "${RUNNER_TEMP}/fixture"
+      - uses: ./actions/scan
+        with:
+          working_dir: ${{ runner.temp }}/fixture/repo
+          base_ref: origin/main
+          report_name: changes
+          report_only: "true"
+          run_record: "true"
+      - uses: ./actions/scan
+        with:
+          working_dir: ${{ runner.temp }}/fixture/repo
+          scope: history
+          report_name: history
+          report_only: "true"
+      - uses: ./actions/scan
+        with:
+          working_dir: ${{ runner.temp }}/fixture/repo
+          source: filesystem
+          report_name: filesystem
+          report_only: "true"
+          run_record: "true"
+      - uses: ./actions/scan
+        with:
+          working_dir: ${{ runner.temp }}/fixture/repo
+          base_ref: origin/main
+          no_ignore_tag: "true"
+          report_name: no-ignore-tag
+          report_only: "true"
+      - id: failing
+        uses: ./actions/scan
+        continue-on-error: true
+        with:
+          working_dir: ${{ runner.temp }}/fixture/repo
+          base_ref: origin/main
+          output_dir: ${{ runner.temp }}/failing
+          store_artifacts: "false"
+      - name: Check what each scan found
+        env:
+          FAILING: ${{ steps.failing.outcome }}
+        run: |
+          [[ "${FAILING}" == failure ]]
+          cd /tmp/trufflehog-reports
+          head=$(git -C "${RUNNER_TEMP}/fixture/repo" rev-parse HEAD)
+          jq -e --arg head "${head}" 'length == 1 and .[0].detector == "Github" and .[0].file == "config/app.env"
+            and .[0].line == 1 and .[0].commit == $head and .[0].result == "unverified"' changes.json
+          jq -e '.target.commits == 1 and .ci.provider == "github-actions"' changes.run-record.json
+          jq -e '[.[].file] | sort == ["config/app.env", "deploy.env"]' history.json
+          jq -e 'length == 1 and .[0].file == "config/app.env"' filesystem.json
+          jq -e '[.[].line] | sort == [1, 2]' no-ignore-tag.json
+          jq -e 'length == 1' "${RUNNER_TEMP}/failing/trufflehog.json"
+          while IFS= read -r token; do
+            if grep -rlF -- "${token}" /tmp/trufflehog-reports "${RUNNER_TEMP}/failing"; then
+              echo "FAIL: a report holds a token."
+              exit 1
+            fi
+          done < "${RUNNER_TEMP}/fixture/tokens"
+      - name: A branch without secrets passes
+        run: git -C "${RUNNER_TEMP}/fixture/repo" checkout -q clean
+      - uses: ./actions/scan
+        with:
+          working_dir: ${{ runner.temp }}/fixture/repo
+          base_ref: origin/main
+          report_name: clean
+      # This run's own commits: a pull request's since its base, or a
+      # push's since the commit before it, taken from the event.
+      - uses: ./actions/scan
+        with:
+          report_name: self
+          run_record: "true"
+      - name: Check the scan of this run's commits
+        run: jq -e '.counts.findings == 0 and (.target.base_from == null or (.target.base_from | test("^(the |origin/)")))' /tmp/trufflehog-reports/self.run-record.json
+      - name: Validate the reports
+        run: |
+          python3 -m pip install --quiet --user jsonschema==4.26.0 || python3 -m pip install --quiet --user --break-system-packages jsonschema==4.26.0
+          bash tests/validate_reports.sh

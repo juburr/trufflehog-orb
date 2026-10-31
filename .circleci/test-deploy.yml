@@ -1,0 +1,300 @@
+version: 2.1
+orbs:
+  # Your orb will be automatically injected here during the pipeline.
+  # Reference your orb's jobs and commands below as they will exist when built.
+  orb-tools: circleci/orb-tools@12.5
+  # The orb definition is intentionally not included here. It will be injected into the pipeline.
+  trufflehog-orb: {}
+
+# Use this tag to ensure test jobs always run,
+# even though the downstream publish job will only run on release tags.
+filters: &filters
+  tags:
+    only: /.*/
+
+# Filter for release tags.
+release-filters: &release-filters
+  branches:
+    ignore: /.*/
+  tags:
+    only: /^v[0-9]+\.[0-9]+\.[0-9]+$/
+
+commands:
+  # Makes ~/fixture/repo (see tests/make_fixture_repo.sh): a token only in main's history, a new
+  # one on the branch feature, one marked trufflehog:ignore, and a branch clean with no secret.
+  # The tokens are random and made here, so the repository holds no secret.
+  make-fixture:
+    steps:
+      - run:
+          name: Make The Fixture Repository
+          command: bash tests/make_fixture_repo.sh ~/fixture
+
+jobs:
+  # Installs the default version and checks it is the binary the checksum table pins, that a second
+  # install takes it from the cache, and that the oldest listed release installs too.
+  install-test:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - trufflehog-orb/install
+      - run:
+          name: Verify The Install
+          command: |
+            version=$(grep -A3 '^  version:' src/commands/install.yml | sed -n 's/^    default: "\(.*\)"$/\1/p')
+            [[ "$(command -v trufflehog)" == "${HOME}/bin/trufflehog" ]]
+            trufflehog --no-update --version | tee /tmp/version.log
+            grep -qx "trufflehog ${version}" /tmp/version.log
+            expected=$(grep -F "[\"${version}/amd64\"]" src/scripts/install.sh | cut -d'"' -f4)
+            [[ "$(sha512sum ~/bin/trufflehog | cut -d' ' -f1)" == "${expected}" ]]
+      - run:
+          name: Verify A Second Install Uses The Cache
+          command: |
+            version=$(grep -A3 '^  version:' src/commands/install.yml | sed -n 's/^    default: "\(.*\)"$/\1/p')
+            PARAM_VERSION="${version}" PARAM_VERIFY_CHECKSUMS=strict PARAM_INSTALL_PATH="" PARAM_CACHING=true \
+              PARAM_DOWNLOAD_BASE_URL="" bash src/scripts/install.sh 2>&1 | tee /tmp/second-install.log
+            grep -q "from the cache." /tmp/second-install.log
+            if grep -q "^Downloading" /tmp/second-install.log; then
+              echo "FAIL: the second install downloaded TruffleHog again."
+              exit 1
+            fi
+      - trufflehog-orb/install:
+          version: 3.97.0
+          install_path: ~/trufflehog-3.97.0
+      - run:
+          name: Verify The Oldest Listed Release Installs
+          command: |
+            ~/trufflehog-3.97.0/trufflehog --no-update --version | grep -qx "trufflehog 3.97.0"
+  # An unlisted release fails closed before anything is downloaded, and known_versions installs it
+  # with a warning. Then a local HTTPS mirror in GitHub's layout serves the real release, which
+  # installs, and one whose binary was changed, which doesn't.
+  checksum-test:
+    docker:
+      - image: cimg/python:3.13
+    steps:
+      - checkout
+      - run:
+          name: An Unlisted Release Is Refused Before Downloading
+          command: |
+            cd "$(mktemp -d)"
+            if HOME="$(pwd)" PARAM_INSTALL_PATH="$(pwd)/bin" PARAM_VERIFY_CHECKSUMS=strict PARAM_VERSION=3.96.0 \
+                PARAM_CACHING=true PARAM_DOWNLOAD_BASE_URL="" bash ~/project/src/scripts/install.sh > install.log 2>&1; then
+              cat install.log
+              echo "FAIL: the unlisted 3.96.0 installed with verify_checksums: strict."
+              exit 1
+            fi
+            cat install.log
+            grep -q "This orb has no checksum for TruffleHog 3.96.0" install.log
+            if [[ -n "$(ls -A | grep -vx install.log)" ]]; then
+              echo "FAIL: install downloaded or installed something before refusing 3.96.0."
+              ls -laR
+              exit 1
+            fi
+      - trufflehog-orb/install:
+          version: 3.96.0
+          verify_checksums: known_versions
+          install_path: ~/trufflehog-3.96.0
+          caching: false
+      - run:
+          name: Verify known_versions Installed It
+          command: ~/trufflehog-3.96.0/trufflehog --no-update --version | grep -qx "trufflehog 3.96.0"
+      - run:
+          name: A Mirror Serves The Release, And A Changed Binary Is Rejected
+          command: |
+            REPO_DIR=$(pwd)
+            VERSION=$(grep -A3 '^  version:' src/commands/install.yml | sed -n 's/^    default: "\(.*\)"$/\1/p')
+            ASSET="trufflehog_${VERSION}_linux_amd64.tar.gz"
+            MIRROR=$(mktemp -d)
+            DIR="${MIRROR}/www/github/trufflesecurity/trufflehog/releases/download/v${VERSION}"
+            mkdir -p "${DIR}"
+            curl --fail --silent --show-error --location --proto '=https' --output "${DIR}/${ASSET}" \
+              "https://github.com/trufflesecurity/trufflehog/releases/download/v${VERSION}/${ASSET}"
+            openssl req -x509 -newkey rsa:2048 -nodes -keyout "${MIRROR}/key.pem" -out "${MIRROR}/cert.pem" -days 1 \
+              -subj /CN=localhost -addext subjectAltName=DNS:localhost 2> /dev/null
+            cat > "${MIRROR}/serve.py" \<< 'EOF'
+            import functools, http.server, ssl, sys
+            handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[1])
+            server = http.server.HTTPServer(("127.0.0.1", 8443), handler)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(sys.argv[2], sys.argv[3])
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            server.serve_forever()
+            EOF
+            python3 "${MIRROR}/serve.py" "${MIRROR}/www" "${MIRROR}/cert.pem" "${MIRROR}/key.pem" > "${MIRROR}/serve.log" 2>&1 &
+            SERVER=$!
+            trap 'kill "${SERVER}"' EXIT
+            sleep 2
+            install_from_mirror() {
+              rm -rf "${MIRROR}/bin"
+              CURL_CA_BUNDLE="${MIRROR}/cert.pem" PARAM_INSTALL_PATH="${MIRROR}/bin" PARAM_VERIFY_CHECKSUMS=strict \
+                PARAM_VERSION="${VERSION}" PARAM_CACHING=false PARAM_DOWNLOAD_BASE_URL=https://localhost:8443/github \
+                bash "${REPO_DIR}/src/scripts/install.sh"
+            }
+            install_from_mirror 2>&1 | tee "${MIRROR}/good.log"
+            grep -q "Downloading https://localhost:8443/github/trufflesecurity/trufflehog/releases/download/v${VERSION}/${ASSET}" "${MIRROR}/good.log"
+            "${MIRROR}/bin/trufflehog" --no-update --version | grep -qx "trufflehog ${VERSION}"
+            # The table pins the binary inside the archive, so the binary is what changes.
+            mkdir "${MIRROR}/unpacked"
+            tar -xzf "${DIR}/${ASSET}" -C "${MIRROR}/unpacked"
+            printf 'x' >> "${MIRROR}/unpacked/trufflehog"
+            tar -czf "${DIR}/${ASSET}" -C "${MIRROR}/unpacked" trufflehog LICENSE README.md docs
+            if install_from_mirror > "${MIRROR}/bad.log" 2>&1; then
+              cat "${MIRROR}/bad.log"
+              echo "FAIL: a changed release from the mirror was installed."
+              exit 1
+            fi
+            cat "${MIRROR}/bad.log"
+            grep -q "Checksum verification failed." "${MIRROR}/bad.log"
+  # Installs on an Arm machine, so the arm64 build is chosen and verified, takes it from the cache the
+  # second time, and scans the fixture's history with it.
+  arm64-test:
+    machine:
+      image: ubuntu-2404:current
+    resource_class: arm.medium
+    steps:
+      - checkout
+      - trufflehog-orb/install
+      - trufflehog-orb/install
+      - run:
+          name: Verify The arm64 Install
+          command: |
+            [[ "$(uname -m)" == aarch64 ]]
+            version=$(grep -A3 '^  version:' src/commands/install.yml | sed -n 's/^    default: "\(.*\)"$/\1/p')
+            expected=$(grep -F "[\"${version}/arm64\"]" src/scripts/install.sh | cut -d'"' -f4)
+            [[ "$(sha512sum "$(command -v trufflehog)" | cut -d' ' -f1)" == "${expected}" ]]
+            trufflehog --no-update --version | grep -qx "trufflehog ${version}"
+      - make-fixture
+      - trufflehog-orb/scan:
+          working_dir: ~/fixture/repo
+          scope: history
+          report_only: true
+      - run:
+          name: Verify The arm64 Scan
+          command: jq -e 'length == 2' /tmp/trufflehog-reports/trufflehog.json
+  # Scans the fixture with the real TruffleHog, every way the command can, and checks what each scan
+  # found, that a scan with findings fails by default, and that no token reaches a report or the log.
+  # Then the orb scans this pull request's own commits, and the reports are validated.
+  scan-test:
+    docker:
+      - image: cimg/python:3.13
+    steps:
+      - checkout
+      - trufflehog-orb/install
+      - make-fixture
+      - trufflehog-orb/scan:
+          working_dir: ~/fixture/repo
+          report_name: changes
+          report_only: true
+          run_record: true
+      - trufflehog-orb/scan:
+          working_dir: ~/fixture/repo
+          scope: history
+          report_name: history
+          report_only: true
+          run_record: true
+      - trufflehog-orb/scan:
+          working_dir: ~/fixture/repo
+          scope: all
+          report_name: all
+          report_only: true
+      - trufflehog-orb/scan:
+          working_dir: ~/fixture/repo
+          source: filesystem
+          report_name: filesystem
+          report_only: true
+          run_record: true
+      - trufflehog-orb/scan:
+          working_dir: ~/fixture/repo
+          no_ignore_tag: true
+          report_name: no-ignore-tag
+          report_only: true
+      # The token is random, so GitHub doesn't accept it, and fail_on verified passes.
+      - trufflehog-orb/scan:
+          working_dir: ~/fixture/repo
+          verify: true
+          fail_on: verified
+          report_name: verified
+          run_record: true
+      - run:
+          name: Check What Each Scan Found
+          command: |
+            cd /tmp/trufflehog-reports
+            head=$(git -C ~/fixture/repo rev-parse HEAD)
+            jq -e --arg head "${head}" 'length == 1 and .[0].detector == "Github" and .[0].file == "config/app.env"
+              and .[0].line == 1 and .[0].commit == $head and .[0].result == "unverified"' changes.json
+            jq -e '.target.commits == 1 and .outcome == "findings-reported" and .counts.failing == 1' changes.run-record.json
+            jq -e '[.[].file] | sort == ["config/app.env", "deploy.env"]' history.json
+            jq -e '.target.commits == 4' history.run-record.json
+            jq -e '[.[].file] | sort == ["config/app.env", "deploy.env"]' all.json
+            jq -e 'length == 1 and .[0].file == "config/app.env" and .[0].commit == null' filesystem.json
+            jq -e '[.[].line] | sort == [1, 2]' no-ignore-tag.json
+            jq -e 'length == 1 and (.[0].result == "unverified" or .[0].result == "unknown")' verified.json
+            jq -e '.target.verification == true and .outcome == "passed"' verified.run-record.json
+            jq -e '.runs[0].results[0].locations[0].physicalLocation.artifactLocation.uri == "config/app.env"' changes.sarif
+            while IFS= read -r token; do
+              if grep -rlF -- "${token}" /tmp/trufflehog-reports; then
+                echo "FAIL: a report holds a token."
+                exit 1
+              fi
+            done < ~/fixture/tokens
+      - run:
+          name: A Secret Fails The Step, And The Log Holds No Token
+          command: |
+            if bash tests/run_command.sh scan working_dir="${HOME}/fixture/repo" output_dir=/tmp/failing > /tmp/failing.log 2>&1; then
+              cat /tmp/failing.log
+              echo "FAIL: a scan that found a secret passed."
+              exit 1
+            fi
+            cat /tmp/failing.log
+            grep -q "ERROR: TruffleHog found 1 secret (0 verified, 0 unknown, 1 unverified); 1 at or above fail_on (unverified)." /tmp/failing.log
+            while IFS= read -r token; do
+              if grep -qF -- "${token}" /tmp/failing.log; then
+                echo "FAIL: the log holds a token."
+                exit 1
+              fi
+            done < ~/fixture/tokens
+      - run:
+          name: A Branch Without Secrets Passes
+          command: |
+            git -C ~/fixture/repo checkout -q clean
+            bash tests/run_command.sh scan working_dir="${HOME}/fixture/repo" output_dir=/tmp/clean | tee /tmp/clean.log
+            grep -q "Passed: TruffleHog found 0 secrets" /tmp/clean.log
+            git -C ~/fixture/repo checkout -q feature
+      # This pull request's own commits, since it left main.
+      - trufflehog-orb/scan:
+          report_name: self
+          run_record: true
+      - run:
+          name: Validate The Reports
+          command: |
+            python3 -m pip install --quiet jsonschema==4.26.0
+            bash tests/validate_reports.sh
+
+workflows:
+  test-deploy:
+    jobs:
+      # Make sure to include "filters: *filters" in every test job you want to run as part of your deployment.
+      - install-test:
+          filters: *filters
+      - checksum-test:
+          filters: *filters
+      - arm64-test:
+          filters: *filters
+      - scan-test:
+          filters: *filters
+      # The orb must be re-packed for publishing, and saved to the workspace.
+      - orb-tools/pack:
+          filters: *release-filters
+      - orb-tools/publish:
+          orb_name: juburr/trufflehog-orb
+          vcs_type: << pipeline.project.type >>
+          pub_type: production
+          # Ensure this job requires all test jobs and the pack job.
+          requires:
+            - orb-tools/pack
+            - install-test
+            - checksum-test
+            - arm64-test
+            - scan-test
+          context: orb-publishing
+          filters: *release-filters

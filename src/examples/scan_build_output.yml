@@ -1,0 +1,28 @@
+description: >
+  Scan files as they are, such as a build's output before it is published,
+  for secrets a build step baked in. source filesystem reads the files under
+  paths and leaves out .git directories; exclude_paths names a file of path
+  patterns not to scan.
+
+usage:
+  version: 2.1
+  orbs:
+    trufflehog: juburr/trufflehog-orb@0.1.0
+  jobs:
+    build:
+      docker:
+        - image: cimg/node:lts
+      steps:
+        - checkout
+        - run:
+            name: Build
+            command: npm ci && npm run build
+        - trufflehog/install
+        - trufflehog/scan:
+            source: filesystem
+            paths: dist
+            report_name: build-output
+  workflows:
+    build:
+      jobs:
+        - build
