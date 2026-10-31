@@ -247,8 +247,13 @@ stop() {
 # --- What to scan ---
 OPTIONS=()
 TARGETS=()
-TH_TARGET_JSON=null
 COMMITS=0
+# What the parameters say, so a run record of a scan that stops before the
+# target is worked out (outside a checkout, without a base) still names it.
+# shellcheck disable=SC2034 # read by th_run_record
+TH_TARGET_JSON=$(jq -cn --arg source "${SOURCE}" --arg scope "${SCOPE}" --argjson verify "${VERIFY}" \
+    '{source: $source, scope: (if $source == "git" then $scope else null end), repository: null, head: null, base: null,
+      base_from: null, commits: null, shallow: null, paths: null, verification: $verify}')
 if [[ "${SOURCE}" == git ]]; then
     if ! TOP=$(git rev-parse --show-toplevel 2> /dev/null) || [[ -z "${TOP}" ]]; then
         stop "source is git, and $(pwd) is not in a git checkout. Set working_dir to the checkout, or scan the" \

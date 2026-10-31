@@ -344,9 +344,11 @@ run working_dir="${CLONE}"
 check "without a base_ref or an origin, the step fails" rc_is 1
 check "saying what to set" said "Set base_ref to the branch, tag or commit whose code is already scanned, or set scope to history."
 mkdir -p "${WORK}/plain"
-run working_dir="${WORK}/plain"
+run working_dir="${WORK}/plain" run_record=true
 check "outside a git checkout, source git fails" rc_is 1
 check "saying so" said "is not in a git checkout"
+check "with a run record that names what was asked for" json_is trufflehog.run-record.json \
+    '[.outcome, .target.source, .target.scope, .target.repository, .target.verification]' '["error","git","changes",null,false]'
 SHALLOW="${WORK}/shallow"
 git clone -q --depth 1 -b feature "file://${JOB}" "${SHALLOW}"
 run working_dir="${SHALLOW}" base_ref=origin/main
