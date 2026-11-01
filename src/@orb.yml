@@ -1,0 +1,12 @@
+version: 2.1
+
+description: >
+  Install a checksum-verified TruffleHog and scan a git checkout's new
+  commits, its history, or a directory for leaked secrets, with JSON, SARIF
+  and JUnit reports that never hold the secrets themselves, and a gate. Live
+  verification of what it finds is off unless you turn it on. Every command
+  has a GitHub Action of the same name.
+
+display:
+  home_url: "https://github.com/juburr/trufflehog-orb"
+  source_url: "https://github.com/juburr/trufflehog-orb"

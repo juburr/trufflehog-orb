@@ -1,0 +1,23 @@
+description: >
+  Scan the commits a branch adds for secrets on every build: since it left
+  origin/main, or whatever origin/HEAD names. A secret committed and then
+  deleted on the branch is still found, and one already in main's history
+  doesn't fail every branch. The step fails on any secret found; the reports
+  never hold the secrets themselves.
+
+usage:
+  version: 2.1
+  orbs:
+    trufflehog: juburr/trufflehog-orb@0.1.0
+  jobs:
+    secrets:
+      docker:
+        - image: cimg/base:current
+      steps:
+        - checkout
+        - trufflehog/install
+        - trufflehog/scan
+  workflows:
+    secrets:
+      jobs:
+        - secrets

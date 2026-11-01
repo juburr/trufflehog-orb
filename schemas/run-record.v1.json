@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/juburr/trufflehog-orb/blob/main/schemas/run-record.v1.json",
+  "title": "trufflehog-orb run record, version 1",
+  "description": "What one trufflehog-orb scan ran, on what, with which TruffleHog, and what it found, without any part of a secret: written as <report_name>.run-record.json when the scan command's run_record parameter is true. Fields are only ever added within version 1; a change that would break a reader gets a new schema URL.",
+  "type": "object",
+  "required": [
+    "schema", "command", "outcome", "exit_code", "started_at", "finished_at", "ci", "working_directory",
+    "tool", "arguments", "target", "scan", "gate", "counts", "reports"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://github.com/juburr/trufflehog-orb/blob/main/schemas/run-record.v1.json"
+    },
+    "command": {
+      "description": "The orb command that wrote the record.",
+      "enum": ["scan"]
+    },
+    "outcome": {
+      "description": "passed: no secrets at or above fail_on. findings: secrets failed the step. findings-reported: secrets, passed because report_only is true. error: the scan did not complete, reported a scan error, or scanned nothing, so there is no verdict, and the step failed.",
+      "enum": ["passed", "findings", "findings-reported", "error"]
+    },
+    "exit_code": {
+      "description": "1 when the outcome is error, else 0. The step's own exit code also depends on report_only.",
+      "type": "integer"
+    },
+    "started_at": { "$ref": "#/$defs/timestamp" },
+    "finished_at": { "$ref": "#/$defs/timestamp" },
+    "ci": {
+      "description": "The CI job the command ran in: a CircleCI job (from CIRCLE_BUILD_URL, CIRCLE_SHA1, CIRCLE_JOB and the project), or a GitHub Actions run (from GITHUB_SERVER_URL, GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_SHA and GITHUB_JOB); null elsewhere.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["provider", "build_url", "sha1", "job", "repository"],
+          "properties": {
+            "provider": { "enum": ["circleci", "github-actions"] },
+            "build_url": { "type": "string" },
+            "sha1": { "type": "string" },
+            "job": { "type": "string" },
+            "repository": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "working_directory": {
+      "description": "The absolute directory the command ran in. Relative paths in arguments and target are relative to it.",
+      "type": "string"
+    },
+    "tool": {
+      "description": "The trufflehog that ran, with its SHA-512; null when it was not found.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["name", "path", "version", "sha512"],
+          "properties": {
+            "name": { "const": "trufflehog" },
+            "path": { "type": "string" },
+            "version": { "description": "What trufflehog --version reports, without a leading v.", "type": "string" },
+            "sha512": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha512" }] }
+          }
+        }
+      ]
+    },
+    "arguments": {
+      "description": "The TruffleHog source (git or filesystem) and the options that decide what it scanned and reported, such as --since-commit, --branch, --no-verification and --results; without the options the command adds to read its output (--json, --no-update, --no-color), and without the target, which is in target. URLs lose their userinfo, query and fragment.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "target": {
+      "description": "What was scanned.",
+      "type": "object",
+      "required": ["source", "scope", "repository", "head", "base", "base_from", "commits", "shallow", "partial_clone", "fetched_objects", "paths", "verification"],
+      "properties": {
+        "source": { "enum": ["git", "filesystem"] },
+        "scope": { "description": "For source git: changes, history or all.", "enum": ["changes", "history", "all", null] },
+        "repository": { "description": "For source git: the top of the checkout.", "type": ["string", "null"] },
+        "head": { "description": "For source git: the commit HEAD was.", "type": ["string", "null"] },
+        "base": { "description": "For scope changes: the merge base the scan started after.", "type": ["string", "null"] },
+        "base_from": { "description": "For scope changes: what the merge base was taken with, such as origin/main, base_ref main, or the pull request's base.", "type": ["string", "null"] },
+        "commits": { "description": "For source git: how many commits were in the range, by git rev-list.", "type": ["integer", "null"], "minimum": 0 },
+        "shallow": { "description": "For source git: whether the checkout is a shallow clone, which holds only part of the history.", "type": ["boolean", "null"] },
+        "partial_clone": { "description": "For source git: whether the checkout is a partial clone (such as CircleCI's blobless checkout), which lacks objects until git fetches them from a promisor remote.", "type": ["boolean", "null"] },
+        "fetched_objects": { "description": "For a partial clone: how many objects were fetched into it before the scan, since TruffleHog clones the checkout and git serves no clone from a repository that lacks objects. Null when nothing was fetched first: not a partial clone, a scan with no commits, or --trust-local-git-config, with which TruffleHog scans the checkout where it is.", "type": ["integer", "null"], "minimum": 0 },
+        "paths": { "description": "For source filesystem: the paths scanned.", "type": ["array", "null"], "items": { "type": "string" } },
+        "verification": { "description": "Whether TruffleHog checked the secrets it found with the services they belong to (verify).", "type": "boolean" }
+      }
+    },
+    "scan": {
+      "description": "TruffleHog's own summary of the scan, from its \"finished scanning\" log line; null when it didn't run (no commits to scan) or ended before it.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "properties": {
+            "chunks": { "type": ["integer", "null"] },
+            "bytes": { "type": ["integer", "null"] },
+            "verified_secrets": { "type": ["integer", "null"] },
+            "unverified_secrets": { "type": ["integer", "null"] },
+            "scan_duration": { "type": ["string", "null"] },
+            "trufflehog_version": { "type": ["string", "null"] }
+          }
+        }
+      ]
+    },
+    "gate": {
+      "description": "The settings the verdict follows.",
+      "type": "object",
+      "required": ["fail_on", "report_only", "allow_empty"],
+      "properties": {
+        "fail_on": { "enum": ["unverified", "unknown", "verified"] },
+        "report_only": { "type": "boolean" },
+        "allow_empty": { "type": "boolean" }
+      }
+    },
+    "counts": {
+      "description": "What the findings report holds; null when there is no report.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["findings", "failing", "verified", "unknown", "unverified", "detectors"],
+          "properties": {
+            "findings": { "description": "Every secret TruffleHog reported.", "type": "integer", "minimum": 0 },
+            "failing": { "description": "The secrets at or above fail_on.", "type": "integer", "minimum": 0 },
+            "verified": { "type": "integer", "minimum": 0 },
+            "unknown": { "type": "integer", "minimum": 0 },
+            "unverified": { "type": "integer", "minimum": 0 },
+            "detectors": {
+              "description": "How many secrets each detector found.",
+              "type": "object",
+              "additionalProperties": { "type": "integer", "minimum": 1 }
+            }
+          }
+        }
+      ]
+    },
+    "reports": {
+      "description": "The report files written before the record, with their SHA-256.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": { "type": "string" },
+          "sha256": { "$ref": "#/$defs/sha256" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "timestamp": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "sha512": { "type": "string", "pattern": "^[0-9a-f]{128}$" }
+  }
+}

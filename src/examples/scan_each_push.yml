@@ -1,0 +1,23 @@
+description: >
+  Scan what each push adds, on every branch, the default branch included:
+  pipeline.git.base_revision is the commit the branch was at before the
+  push. When it is empty, as it can be for a new branch, the scan compares
+  with origin/HEAD.
+
+usage:
+  version: 2.1
+  orbs:
+    trufflehog: juburr/trufflehog-orb@0.1.0
+  jobs:
+    secrets:
+      docker:
+        - image: cimg/base:current
+      steps:
+        - checkout
+        - trufflehog/install
+        - trufflehog/scan:
+            base_ref: << pipeline.git.base_revision >>
+  workflows:
+    secrets:
+      jobs:
+        - secrets
