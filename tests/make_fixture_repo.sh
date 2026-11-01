@@ -4,6 +4,9 @@
 #
 #   DIR/origin.git  a bare repository with main
 #   DIR/repo        a clone of it, on the branch feature
+#   DIR/partial     a blobless clone of DIR/repo on feature, as CircleCI's
+#                   checkout makes by default: it lacks the blobs of files
+#                   that aren't in feature's tree, such as deploy.env
 #
 # main: a README, then deploy.env with a token (the "old" token), then a
 # commit that deletes it, so it is only in history. feature, from main:
@@ -66,5 +69,9 @@ mkdir -p "${DIR}/repo/config"
     printf 'other = "%s" # trufflehog:ignore\n' "${IGNORED}"
 } > "${DIR}/repo/config/app.env"
 commit "configure the app"
+
+git -C "${DIR}/repo" config uploadpack.allowFilter true
+git -C "${DIR}/repo" config uploadpack.allowAnySHA1InWant true
+git clone -q --filter=blob:none -b feature "file://${DIR}/repo" "${DIR}/partial"
 
 echo "Made ${DIR}/repo on feature, with origin/main $(git -C "${DIR}/repo" rev-parse --short origin/main)."

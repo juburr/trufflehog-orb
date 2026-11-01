@@ -74,6 +74,7 @@ JSON with every finding, SARIF for GitHub code scanning, and JUnit for CircleCI'
 | `--since-commit main` in a CI checkout | fails to resolve in TruffleHog's own clone, scans nothing, exits 0 | SHAs, and a scan error fails the step |
 | A scan that scanned nothing | passes | fails |
 | Pre-commit variables (`HUSKY`, `PRE_COMMIT`) in the job | turn the scan into a scan of staged changes only | ignored |
+| CircleCI's blobless `checkout` | TruffleHog can't clone it, and the scan fails | the objects it lacks are fetched first |
 
 ## 🔄 How It Works
 
@@ -115,6 +116,8 @@ workflows:
 ```
 
 The scan reads the commits the branch adds to `origin/main` (or whatever `origin/HEAD` names), fails on any secret found, and stores the reports in the job's artifacts under `trufflehog-reports/` and the findings in its Tests tab. On the default branch itself there is nothing to compare with; to scan what each push adds there too, pass `base_ref: << pipeline.git.base_revision >>`.
+
+CircleCI's `checkout` makes a blobless clone by default, which lacks the files of older commits. TruffleHog clones the checkout before scanning it, and git can't clone a repository that lacks objects, so the scan first fetches what the checkout lacks from its remote, in one request. That downloads about what a full checkout would; `checkout: method: full` makes one in the first place.
 
 ### GitHub Actions
 
@@ -281,7 +284,7 @@ What one action exports, later steps see, as with CircleCI's `BASH_ENV`. A few d
 - **Verification is opt-in.** With `verify: false` (the default) the scan passes `--no-verification`, and no secret leaves the job.
 - **No self-update.** Every scan passes `--no-update`. Without it, TruffleHog posts its version, OS and time zone to `oss.trufflehog.org` and replaces itself with whatever comes back, unsigned, before scanning.
 - **Verified downloads.** TruffleHog is checked against this orb's SHA-512 table before it ever runs, and a cached copy is checked again.
-- **The checkout's git configuration isn't trusted.** TruffleHog clones the checkout before scanning it, so nothing the repository's `.git/config` names runs; `--trust-local-git-config` in `extra_args` opts out.
+- **The checkout's git configuration isn't trusted.** TruffleHog clones the checkout before scanning it, so nothing the repository's `.git/config` names runs in TruffleHog; `--trust-local-git-config` in `extra_args` opts out. A partial clone, such as CircleCI's default blobless checkout, is completed first with `git fetch` from its own remote, which uses the checkout's settings as any fetch does.
 - **Nothing executed from parameters.** `extra_args` is split like shell words, with nothing expanded or run, and only TruffleHog's tuning options are accepted.
 - **No `sudo`.** Everything installs and caches under `HOME`.
 
@@ -312,8 +315,9 @@ What one action exports, later steps see, as with CircleCI's `BASH_ENV`. A few d
 |---|---|
 | `github.com` (and its release asset hosts) | `install`, unless `download_base_url` names a mirror, or the release comes from the cache |
 | Each secret's service, such as `api.github.com` or AWS | `scan` with `verify: true` only |
+| The checkout's own remote, such as `github.com` | `scan` with `source: git` of a partial clone (CircleCI's default blobless checkout), for the objects it lacks |
 
-A scan with `verify: false` makes no network call: it scans the local checkout or files, and never checks for updates.
+A scan with `verify: false` sends no secret anywhere and never checks for updates. It scans the local checkout or files, fetching only what a partial clone lacks from that clone's own remote.
 
 ## 🗺️ Not Yet Included
 

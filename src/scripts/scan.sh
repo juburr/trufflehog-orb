@@ -183,6 +183,7 @@ VALUE_OPTIONS=" concurrency detector-timeout archive-max-size archive-max-depth 
 FLAG_OPTIONS=" allow-verification-overlap no-verification-cache filter-unverified force-skip-binaries
     force-skip-archives trust-local-git-config skip-additional-refs drop-unverified-jwt-results custom-verifiers-only "
 expect_value=false
+TRUST_LOCAL=false
 for word in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do
     if [[ "${expect_value}" == true ]]; then
         expect_value=false
@@ -199,7 +200,9 @@ for word in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do
             expect_value=true
         fi
     elif [[ "${FLAG_OPTIONS}" =~ [[:space:]]${name}[[:space:]] && "${word}" != *=* ]]; then
-        :
+        if [[ "${name}" == trust-local-git-config ]]; then
+            TRUST_LOCAL=true
+        fi
     else
         usage "extra_args can't hold '${word}'. It takes TruffleHog's tuning options:" \
             "--concurrency, --detector-timeout, --archive-max-size, --archive-max-depth, --archive-timeout," \
@@ -248,12 +251,15 @@ stop() {
 OPTIONS=()
 TARGETS=()
 COMMITS=0
+PROMISORS=()
+PARTIAL=false
 # What the parameters say, so a run record of a scan that stops before the
 # target is worked out (outside a checkout, without a base) still names it.
 # shellcheck disable=SC2034 # read by th_run_record
 TH_TARGET_JSON=$(jq -cn --arg source "${SOURCE}" --arg scope "${SCOPE}" --argjson verify "${VERIFY}" \
     '{source: $source, scope: (if $source == "git" then $scope else null end), repository: null, head: null, base: null,
-      base_from: null, commits: null, shallow: null, paths: null, verification: $verify}')
+      base_from: null, commits: null, shallow: null, partial_clone: null, fetched_objects: null, paths: null,
+      verification: $verify}')
 if [[ "${SOURCE}" == git ]]; then
     if ! TOP=$(git rev-parse --show-toplevel 2> /dev/null) || [[ -z "${TOP}" ]]; then
         stop "source is git, and $(pwd) is not in a git checkout. Set working_dir to the checkout, or scan the" \
@@ -263,6 +269,24 @@ if [[ "${SOURCE}" == git ]]; then
         stop "The checkout in ${TOP} has no commit to scan."
     fi
     SHALLOW=$(git rev-parse --is-shallow-repository 2> /dev/null || echo false)
+    # A partial clone (CircleCI's checkout is blobless by default) lacks
+    # objects, which git fetches from its promisor remotes when a command
+    # needs them.
+    PROMISORS=()
+    if remote=$(git config --get extensions.partialclone 2> /dev/null) && [[ -n "${remote}" ]]; then
+        PROMISORS+=("${remote}")
+    fi
+    while IFS=' ' read -r key value; do
+        remote=${key#remote.}
+        remote=${remote%.promisor}
+        if [[ "${value}" == true && " ${PROMISORS[*]-} " != *" ${remote} "* ]]; then
+            PROMISORS+=("${remote}")
+        fi
+    done < <(git config --bool --get-regexp '^remote\..+\.promisor$' 2> /dev/null || true)
+    PARTIAL=false
+    if [[ ${#PROMISORS[@]} -gt 0 ]]; then
+        PARTIAL=true
+    fi
     BASE=""
     BASE_FROM=""
     if [[ "${SCOPE}" == changes ]]; then
@@ -359,14 +383,17 @@ if [[ "${SOURCE}" == git ]]; then
         OPTIONS+=("--exclude-paths=${EXCLUDE_PATHS}")
     fi
     # TruffleHog clones the checkout before scanning it, so the repository's
-    # own git configuration never runs anything.
+    # own git configuration never runs anything in TruffleHog (unless
+    # extra_args has --trust-local-git-config).
     TARGETS=("file://$(jq -rn --arg path "${TOP}" '$path | @uri | gsub("%2F"; "/")')")
     # shellcheck disable=SC2034 # read by th_run_record
     TH_TARGET_JSON=$(jq -cn --arg scope "${SCOPE}" --arg repo "${TOP}" --arg head "${HEAD_SHA}" --arg base "${BASE}" \
         --arg from "${BASE_FROM}" --argjson commits "${COMMITS}" --argjson shallow "${SHALLOW}" --argjson verify "${VERIFY}" \
+        --argjson partial "${PARTIAL}" \
         '{source: "git", scope: $scope, repository: $repo, head: $head,
           base: (if $base == "" then null else $base end), base_from: (if $from == "" then null else $from end),
-          commits: $commits, shallow: $shallow, paths: null, verification: $verify}')
+          commits: $commits, shallow: $shallow, partial_clone: $partial, fetched_objects: null, paths: null,
+          verification: $verify}')
 else
     for path in "${PATHS[@]}"; do
         if [[ "${path}" == \~ || "${path}" == \~/* ]]; then
@@ -389,7 +416,8 @@ else
     # shellcheck disable=SC2034 # read by th_run_record
     TH_TARGET_JSON=$(jq -cn --argjson verify "${VERIFY}" --args \
         '{source: "filesystem", scope: null, repository: null, head: null, base: null, base_from: null,
-          commits: null, shallow: null, paths: $ARGS.positional, verification: $verify}' "${TARGETS[@]}")
+          commits: null, shallow: null, partial_clone: null, fetched_objects: null, paths: $ARGS.positional,
+          verification: $verify}' "${TARGETS[@]}")
 fi
 if [[ -n "${INCLUDE_PATHS}" ]]; then
     OPTIONS+=("--include-paths=${INCLUDE_PATHS}")
@@ -470,6 +498,62 @@ if [[ "${SOURCE}" == git && "${COMMITS}" -eq 0 ]]; then
     echo '[]' > "${WORK}/secrets.json"
     echo '[]' > "${WORK}/findings.json"
     finish "${WORK}/findings.json"
+fi
+
+# --- A partial clone's missing objects ---
+# TruffleHog clones the checkout, and git serves no clone from a repository
+# that lacks objects: upload-pack never fetches them from a promisor remote.
+# So the objects the checkout's refs reach that it lacks are fetched first,
+# the way git fetches them when a command needs them: one request, by object
+# ID, from a promisor remote. A treeless clone takes a second pass, for the
+# blobs of the trees the first one fetched. git rev-list lists them without
+# fetching anything, and the fetch updates no ref.
+complete_partial_clone() {
+    local pass missing remote fetched=0 ok
+    for pass in 1 2 3 4 5 6; do
+        if ! git rev-list --objects --all --missing=print 2> "${WORK}/rev-list.err" \
+            | sed -n 's/^?//p' > "${WORK}/missing.txt"; then
+            th_tail "${WORK}/rev-list.err" 10
+            stop "git rev-list could not list the objects in this partial clone, which TruffleHog's clone of it" \
+                "needs. This is not a scan result."
+        fi
+        missing=$(wc -l < "${WORK}/missing.txt")
+        missing=${missing//[[:space:]]/}
+        if [[ "${missing}" -eq 0 ]]; then
+            break
+        fi
+        if [[ "${pass}" -eq 6 ]]; then
+            stop "This partial clone still lacks $(th_plural "${missing}" object objects) after ${fetched} were fetched," \
+                "so TruffleHog can't clone it. Check out the whole repository (CircleCI: checkout with method: full)."
+        fi
+        echo "This checkout is a partial clone, which lacks $(th_plural "${missing}" object objects) TruffleHog's clone of it"
+        echo "  needs, since git serves no clone from a repository that lacks objects. Fetching them from ${PROMISORS[*]}."
+        ok=false
+        for remote in "${PROMISORS[@]}"; do
+            if GIT_TERMINAL_PROMPT=0 git -c fetch.negotiationAlgorithm=noop fetch --progress --no-tags \
+                --no-write-fetch-head --recurse-submodules=no --filter=blob:none --stdin "${remote}" \
+                < "${WORK}/missing.txt"; then
+                ok=true
+                break
+            fi
+        done
+        if [[ "${ok}" != true ]]; then
+            stop "git could not fetch the objects this partial clone lacks from ${PROMISORS[*]} (above), so TruffleHog" \
+                "can't clone it. Check out the whole repository (CircleCI: checkout with method: full), or give the" \
+                "job access to the remote. This is not a scan result."
+        fi
+        fetched=$((fetched + missing))
+    done
+    # shellcheck disable=SC2034 # read by th_run_record
+    TH_TARGET_JSON=$(jq -c --argjson fetched "${fetched}" '.fetched_objects = $fetched' <<< "${TH_TARGET_JSON}")
+}
+if [[ "${SOURCE}" == git && "${PARTIAL}" == true ]]; then
+    if [[ "${TRUST_LOCAL}" == true ]]; then
+        echo "This checkout is a partial clone. With --trust-local-git-config, TruffleHog scans it where it is, and git"
+        echo "  fetches the objects the scan reads as it reads them, using the checkout's git configuration."
+    else
+        complete_partial_clone
+    fi
 fi
 
 # --- Scan ---

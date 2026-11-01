@@ -163,6 +163,13 @@ jobs:
           no_ignore_tag: "true"
           report_name: no-ignore-tag
           report_only: "true"
+      - uses: ./actions/scan
+        with:
+          working_dir: ${{ runner.temp }}/fixture/partial
+          base_ref: origin/main
+          report_name: partial
+          report_only: "true"
+          run_record: "true"
       - id: failing
         uses: ./actions/scan
         continue-on-error: true
@@ -184,6 +191,12 @@ jobs:
           jq -e '[.[].file] | sort == ["config/app.env", "deploy.env"]' history.json
           jq -e 'length == 1 and .[0].file == "config/app.env"' filesystem.json
           jq -e '[.[].line] | sort == [1, 2]' no-ignore-tag.json
+          jq -e 'length == 1 and .[0].file == "config/app.env"' partial.json
+          jq -e '.target.partial_clone == true and .target.fetched_objects > 0' partial.run-record.json
+          if git -C "${RUNNER_TEMP}/fixture/partial" rev-list --objects --all --missing=print | grep -q '^?'; then
+            echo "FAIL: the partial clone still lacks objects."
+            exit 1
+          fi
           jq -e 'length == 1' "${RUNNER_TEMP}/failing/trufflehog.json"
           while IFS= read -r token; do
             if grep -rlF -- "${token}" /tmp/trufflehog-reports "${RUNNER_TEMP}/failing"; then

@@ -208,6 +208,13 @@ jobs:
           no_ignore_tag: true
           report_name: no-ignore-tag
           report_only: true
+      # A blobless clone, as CircleCI's checkout makes by default: the scan fetches what it lacks first.
+      - trufflehog-orb/scan:
+          working_dir: ~/fixture/partial
+          base_ref: origin/main
+          report_name: partial
+          report_only: true
+          run_record: true
       # The token is random, so GitHub doesn't accept it, and fail_on verified passes.
       - trufflehog-orb/scan:
           working_dir: ~/fixture/repo
@@ -228,6 +235,12 @@ jobs:
             jq -e '[.[].file] | sort == ["config/app.env", "deploy.env"]' all.json
             jq -e 'length == 1 and .[0].file == "config/app.env" and .[0].commit == null' filesystem.json
             jq -e '[.[].line] | sort == [1, 2]' no-ignore-tag.json
+            jq -e 'length == 1 and .[0].file == "config/app.env"' partial.json
+            jq -e '.target.partial_clone == true and .target.fetched_objects > 0' partial.run-record.json
+            if git -C ~/fixture/partial rev-list --objects --all --missing=print | grep -q '^?'; then
+              echo "FAIL: the partial clone still lacks objects."
+              exit 1
+            fi
             jq -e 'length == 1 and (.[0].result == "unverified" or .[0].result == "unknown")' verified.json
             jq -e '.target.verification == true and .outcome == "passed"' verified.run-record.json
             jq -e '.runs[0].results[0].locations[0].physicalLocation.artifactLocation.uri == "config/app.env"' changes.sarif
@@ -260,7 +273,8 @@ jobs:
             bash tests/run_command.sh scan working_dir="${HOME}/fixture/repo" output_dir=/tmp/clean | tee /tmp/clean.log
             grep -q "Passed: TruffleHog found 0 secrets" /tmp/clean.log
             git -C ~/fixture/repo checkout -q feature
-      # This pull request's own commits, since it left main.
+      # This pull request's own commits, since it left main, in this job's checkout, which CircleCI makes
+      # blobless by default.
       - trufflehog-orb/scan:
           report_name: self
           run_record: true

@@ -71,7 +71,7 @@
     "target": {
       "description": "What was scanned.",
       "type": "object",
-      "required": ["source", "scope", "repository", "head", "base", "base_from", "commits", "shallow", "paths", "verification"],
+      "required": ["source", "scope", "repository", "head", "base", "base_from", "commits", "shallow", "partial_clone", "fetched_objects", "paths", "verification"],
       "properties": {
         "source": { "enum": ["git", "filesystem"] },
         "scope": { "description": "For source git: changes, history or all.", "enum": ["changes", "history", "all", null] },
@@ -81,6 +81,8 @@
         "base_from": { "description": "For scope changes: what the merge base was taken with, such as origin/main, base_ref main, or the pull request's base.", "type": ["string", "null"] },
         "commits": { "description": "For source git: how many commits were in the range, by git rev-list.", "type": ["integer", "null"], "minimum": 0 },
         "shallow": { "description": "For source git: whether the checkout is a shallow clone, which holds only part of the history.", "type": ["boolean", "null"] },
+        "partial_clone": { "description": "For source git: whether the checkout is a partial clone (such as CircleCI's blobless checkout), which lacks objects until git fetches them from a promisor remote.", "type": ["boolean", "null"] },
+        "fetched_objects": { "description": "For a partial clone: how many objects were fetched into it before the scan, since TruffleHog clones the checkout and git serves no clone from a repository that lacks objects. Null when nothing was fetched first: not a partial clone, a scan with no commits, or --trust-local-git-config, with which TruffleHog scans the checkout where it is.", "type": ["integer", "null"], "minimum": 0 },
         "paths": { "description": "For source filesystem: the paths scanned.", "type": ["array", "null"], "items": { "type": "string" } },
         "verification": { "description": "Whether TruffleHog checked the secrets it found with the services they belong to (verify).", "type": "boolean" }
       }

@@ -12,6 +12,9 @@
 #     unless verify, every result, the target after --
 #   - the base for scope changes: base_ref, GitHub's pull_request, push and
 #     merge_group events, origin/HEAD, and no commits to scan
+#   - a partial clone (blobless or treeless) completed before TruffleHog
+#     clones it, unless --trust-local-git-config, and a remote that can't
+#     be reached
 #   - no part of a secret in the log or any report: findings keep where a
 #     secret is, never the secret, a prefix of it or its extra data, and
 #     TruffleHog's log is shown scrubbed; a report that would hold a secret
@@ -72,6 +75,9 @@ EOF
 #   STUB_EXIT         exit with this code, after a kingpin-style error
 #   STUB_NO_SUMMARY   don't log the "finished scanning" line
 #   STUB_CHUNKS, STUB_BYTES  the summary's counts (default 12 and 3456)
+#   STUB_CLONE        for source git, clone the target first, as TruffleHog
+#                     does without --trust-local-git-config, and fail as it
+#                     does when the clone fails
 cat > "${WORK}/bin/trufflehog" << 'EOF'
 #!/usr/bin/env bash
 set +o errexit +o nounset +o pipefail +o xtrace
@@ -95,6 +101,16 @@ for arg in "$@"; do
     esac
 done
 [[ -d "${TMPDIR:-/nonexistent}" ]] || { echo "TMPDIR ${TMPDIR:-} is not a directory" >&2; exit 99; }
+if [[ -n "${STUB_CLONE:-}" && "$1" == git && " $* " != *" --trust-local-git-config "* ]]; then
+    target=${!#}
+    if ! output=$(git clone --quiet -c 'remote.origin.fetch=+refs/*:refs/remotes/origin/*' "${target}" \
+        "${TMPDIR}/trufflehog-clone" 2>&1); then
+        jq -cn --arg error "could not clone repo: ${target}, error executing git clone: ${output}" \
+            '{level: "error", logger: "trufflehog", msg: "error running scan", error: $error}' >&2
+        exit 1
+    fi
+    echo cloned > "${calls}/${n}.cloned"
+fi
 if [[ -n "${STUB_EXIT:-}" ]]; then
     [[ -n "${STUB_RESULTS:-}" ]] && cat "${STUB_RESULTS}"
     [[ -n "${STUB_LOG_LINE:-}" ]] && printf '%s\n' "${STUB_LOG_LINE}" >&2
@@ -354,6 +370,71 @@ git clone -q --depth 1 -b feature "file://${JOB}" "${SHALLOW}"
 run working_dir="${SHALLOW}" base_ref=origin/main
 check "in a shallow clone without the base, the step fails" rc_is 1
 check "saying what to do" said "base_ref origin/main is not a commit in this checkout"
+
+echo "=== a partial clone"
+# As CircleCI's checkout makes by default: a blobless clone, which lacks the
+# blobs of files that aren't in HEAD's tree, such as gone.txt on the branch
+# old, until something fetches them. git serves no clone from it, and
+# TruffleHog clones the checkout (STUB_CLONE).
+PARTIAL_ORIGIN="${WORK}/partial-origin.git"
+git clone -q --bare "${JOB}" "${PARTIAL_ORIGIN}"
+git clone -q "${PARTIAL_ORIGIN}" "${WORK}/partial-work"
+git -C "${WORK}/partial-work" checkout -q -b old origin/main
+echo "gone" > "${WORK}/partial-work/gone.txt"
+git_in "${WORK}/partial-work" add gone.txt
+git_in "${WORK}/partial-work" commit -q -m "a file no other branch has"
+git -C "${WORK}/partial-work" push -q origin old 2> /dev/null
+git -C "${PARTIAL_ORIGIN}" config uploadpack.allowFilter true
+git -C "${PARTIAL_ORIGIN}" config uploadpack.allowAnySHA1InWant true
+# partial_clone FILTER DIR: a partial clone of the origin, on feature.
+partial_clone() { git clone -q --filter="$1" -b feature "file://${PARTIAL_ORIGIN}" "$2"; }
+missing_objects() { git -C "$1" rev-list --objects --all --missing=print | grep -c '^?'; }
+PARTIAL="${WORK}/partial"
+partial_clone blob:none "${PARTIAL}"
+check "the blobless clone lacks a blob" test "$(missing_objects "${PARTIAL}")" -eq 1
+REFS_BEFORE=$(git -C "${PARTIAL}" for-each-ref)
+run working_dir="${PARTIAL}" base_ref=origin/main run_record=true -- STUB_RESULTS="${CLEAN}" STUB_CLONE=1
+check "a partial clone's scan passes" rc_is 0
+check "saying what it lacks" said "This checkout is a partial clone, which lacks 1 object TruffleHog's clone of it"
+check "and where it fetches it from" said "Fetching them from origin."
+check "after which TruffleHog's clone of the checkout works" test -f "${STUB}/calls/1.cloned"
+check "the checkout lacks nothing now" test "$(missing_objects "${PARTIAL}")" -eq 0
+check "with its refs as they were" test "$(git -C "${PARTIAL}" for-each-ref)" == "${REFS_BEFORE}"
+check "the run record says what was fetched" json_is trufflehog.run-record.json \
+    '[.target.partial_clone, .target.fetched_objects]' '[true,1]'
+run working_dir="${PARTIAL}" base_ref=origin/main run_record=true -- STUB_RESULTS="${CLEAN}" STUB_CLONE=1
+check "a partial clone that lacks nothing fetches nothing" not_said "Fetching them"
+check "and says it fetched none" json_is trufflehog.run-record.json '[.target.partial_clone, .target.fetched_objects]' '[true,0]'
+TREELESS="${WORK}/treeless"
+partial_clone tree:0 "${TREELESS}"
+run working_dir="${TREELESS}" base_ref=origin/main run_record=true -- STUB_RESULTS="${CLEAN}" STUB_CLONE=1
+check "a treeless clone takes a second pass, for the blobs of the trees it fetched" rc_is 0
+check "and lacks nothing after it" test "$(missing_objects "${TREELESS}")" -eq 0
+check "TruffleHog's clone works" test -f "${STUB}/calls/1.cloned"
+check "the run record counts both passes" json_is trufflehog.run-record.json '.target.fetched_objects > 1' 'true'
+IN_PLACE="${WORK}/in-place"
+partial_clone blob:none "${IN_PLACE}"
+run working_dir="${IN_PLACE}" base_ref=origin/main extra_args=--trust-local-git-config run_record=true \
+    -- STUB_RESULTS="${CLEAN}" STUB_CLONE=1
+check "with --trust-local-git-config, which scans in place, nothing is fetched first" rc_is 0
+check "saying git fetches what the scan reads" said "With --trust-local-git-config, TruffleHog scans it where it is"
+check "the checkout still lacks the blob" test "$(missing_objects "${IN_PLACE}")" -eq 1
+check "the run record says none was fetched" json_is trufflehog.run-record.json \
+    '[.target.partial_clone, .target.fetched_objects]' '[true,null]'
+UNREACHABLE="${WORK}/unreachable"
+partial_clone blob:none "${UNREACHABLE}"
+git -C "${UNREACHABLE}" remote set-url origin "${WORK}/no-such-origin.git"
+run working_dir="${UNREACHABLE}" base_ref=origin/main run_record=true -- STUB_RESULTS="${CLEAN}" STUB_CLONE=1
+check "a partial clone whose remote can't be reached fails" rc_is 1
+check "saying why" said "git could not fetch the objects this partial clone lacks from origin"
+check "and what to do" said "checkout with method: full"
+check "before trufflehog runs" not_run
+check "with an error run record" json_is trufflehog.run-record.json '[.outcome, .target.partial_clone]' '["error",true]'
+run run_record=true -- STUB_RESULTS="${CLEAN}" STUB_CLONE=1
+check "a full clone fetches nothing" not_said "partial clone"
+check "TruffleHog's clone of it works" test -f "${STUB}/calls/1.cloned"
+check "its run record says it isn't a partial clone" json_is trufflehog.run-record.json \
+    '[.target.partial_clone, .target.fetched_objects]' '[false,null]'
 
 echo "=== scopes history and all"
 run scope=history -- STUB_RESULTS="${CLEAN}"
