@@ -7,7 +7,7 @@ description: >
 usage:
   version: 2.1
   orbs:
-    trufflehog: juburr/trufflehog-orb@0.1.0
+    trufflehog: juburr/trufflehog-orb@0.2.0
   jobs:
     audit:
       docker:
